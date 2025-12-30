@@ -1,54 +1,53 @@
-import time, json, base64, hashlib, hmac, os
-from typing import Any, Dict, Optional
-from config import JWT_SECRET, JWT_EXP_MINUTES
+from datetime import datetime, timedelta
+import jwt
+from werkzeug.security import generate_password_hash, check_password_hash
+
+from config import JWT_SECRET
 from db import users
 
-PBKDF2_ITERS = 200_000
+def hash_password(pw: str) -> str:
+    return generate_password_hash(pw)
 
-def hash_password(password: str, salt: Optional[bytes] = None) -> str:
-    if salt is None:
-        salt = os.urandom(16)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ITERS, dklen=32)
-    return base64.urlsafe_b64encode(salt + dk).decode()
+def verify_password(pw: str, pw_hash: str) -> bool:
+    return check_password_hash(pw_hash or "", pw or "")
 
-def verify_password(password: str, stored: str) -> bool:
-    try:
-        raw = base64.urlsafe_b64decode(stored.encode())
-        salt, dk = raw[:16], raw[16:]
-        test = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ITERS, dklen=32)
-        return hmac.compare_digest(test, dk)
-    except Exception:
-        return False
+def issue_token(user_mac_id: str, role_key: str = "DEPARTMENT_MEMBER"):
+    payload = {
+        "sub": str(user_mac_id),   # identity = MAC (_id)
+        "role_key": role_key,
+        "exp": datetime.utcnow() + timedelta(days=7),
+        "iat": datetime.utcnow(),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
-def _b64url_encode(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+def jwt_verify(token: str):
+    return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
 
-def _b64url_decode(data: str) -> bytes:
-    pad = "=" * ((4 - len(data) % 4) % 4)
-    return base64.urlsafe_b64decode((data + pad).encode())
+def get_user_public(user_mac_id: str):
+    user = users.find_one({"_id": str(user_mac_id)})
+    if not user:
+        return None
 
-def jwt_sign(payload: Dict[str, Any]) -> str:
-    header = {"alg": "HS256", "typ": "JWT"}
-    h = _b64url_encode(json.dumps(header, separators=(",", ":")).encode())
-    p = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
-    msg = f"{h}.{p}".encode()
-    sig = hmac.new(JWT_SECRET.encode(), msg, hashlib.sha256).digest()
-    return f"{h}.{p}.{_b64url_encode(sig)}"
+    email = user.get("company_username")
+    return {
+        "_id": str(user.get("_id")),
+        "user_mac_id": user.get("user_mac_id") or str(user.get("_id")),
+        "company_username": email,
 
-def jwt_verify(token: str) -> Dict[str, Any]:
-    h, p, s = token.split(".")
-    msg = f"{h}.{p}".encode()
-    expected = hmac.new(JWT_SECRET.encode(), msg, hashlib.sha256).digest()
-    if not hmac.compare_digest(_b64url_decode(s), expected):
-        raise ValueError("Bad signature")
-    payload = json.loads(_b64url_decode(p).decode())
-    if int(payload.get("exp", 0)) < int(time.time()):
-        raise ValueError("Expired")
-    return payload
+        # aliases to keep older code from breaking
+        "username": email,
+        "role": user.get("role_key", "DEPARTMENT_MEMBER"),
 
-def issue_token(username: str) -> str:
-    exp = int(time.time() + JWT_EXP_MINUTES * 60)
-    return jwt_sign({"sub": username, "exp": exp})
+        "pc_username": user.get("pc_username"),
+        "department": user.get("department"),
+        "role_key": user.get("role_key", "DEPARTMENT_MEMBER"),
 
-def get_user_public(username: str) -> Optional[Dict[str, Any]]:
-    return users.find_one({"username": username}, {"_id": 0, "password_hash": 0})
+        "license_accepted": bool(user.get("license_accepted", False)),
+        "license_version": user.get("license_version", "1.0"),
+        "license_accepted_at": user.get("license_accepted_at"),
+
+        "created_at": user.get("created_at"),
+        "last_seen_at": user.get("last_seen_at"),
+
+        "is_active": bool(user.get("is_active", True)),
+    }
