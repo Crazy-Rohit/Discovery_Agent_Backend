@@ -25,7 +25,8 @@ def ingest_log_payload() -> Dict[str, Any]:
     if not username or not mac_id:
         raise ValueError("username and mac_id required")
 
-    user_doc = col_users.find_one({"username": username}, {"department": 1})
+    user_doc = col_users.find_one({"company_username": username}, {"department": 1})
+
     if not user_doc:
         raise ValueError("unknown username")
 
