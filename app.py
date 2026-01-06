@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, request
 from flask_cors import CORS
 from datetime import datetime
 import secrets
@@ -14,7 +14,7 @@ from auth import (
     jwt_verify,
 )
 
-from rbac import ROLE_C_SUITE, ROLE_DEPT_HEAD, ROLE_TEAM_MEMBER
+from rbac import ROLE_C_SUITE, ROLE_DEPT_HEAD, ROLE_TEAM_MEMBER, scope_filter_for_logs;
 
 import users_api
 import departments_api
@@ -354,22 +354,37 @@ def ingest_screenshot():
         return err(str(e), 400)
 
 
-# ---------------- Data tables ----------------
+# ---------- DATA: LOGS ----------
 @app.get("/api/logs")
-def logs_table():
+def api_logs():
     u = require_auth()
     if not u:
         return err("unauthorized", 401)
-    try:
-        return ok(data_api.get_logs(u))
-    except PermissionError as e:
-        return err(str(e), 403)
-    except Exception as e:
-        return err(str(e), 400)
+
+    params = {
+        "from": request.args.get("from"),
+        "to": request.args.get("to"),
+        "page": request.args.get("page", 1),
+        "limit": request.args.get("limit", 50),
+    }
+    return ok(data_api.list_logs(u, params))
 
 
+# ---------- DATA: SCREENSHOTS ----------
 @app.get("/api/screenshots")
-def screenshots_table():
+def api_screenshots():
+    u = require_auth()
+    if not u:
+        return err("unauthorized", 401)
+
+    params = {
+        "from": request.args.get("from"),
+        "to": request.args.get("to"),
+        "page": request.args.get("page", 1),
+        "limit": request.args.get("limit", 50),
+    }
+    return ok(data_api.list_screenshots(u, params))
+
     u = require_auth()
     if not u:
         return err("unauthorized", 401)
@@ -382,126 +397,77 @@ def screenshots_table():
 
 
 # ---------------- Insights ----------------
+
+
+# ---------- INSIGHTS: SUMMARY ----------
 @app.get("/api/insights/summary")
 def insights_summary():
     u = require_auth()
     if not u:
         return err("unauthorized", 401)
 
-    from rbac import scope_filter_for_logs, is_user_visible_to, is_dept_visible_to
-    q = scope_filter_for_logs(u)
+    from_day = (request.args.get("from") or "").strip()
+    to_day = (request.args.get("to") or "").strip()
+    if not from_day or not to_day:
+        return err("from and to are required (YYYY-MM-DD)", 400)
 
-    username = (request.args.get("username") or "").strip()
-    dept = (request.args.get("department") or "").strip()
-    device = (request.args.get("device") or "").strip()
-
-    if username:
-        if not is_user_visible_to(u, username):
-            return err("forbidden username scope", 403)
-
-        # ✅ support both styles (some code expects username, but DB uses company_username)
-        q["company_username"] = username.lower()
-        q["username"] = username.lower()
-
-    if dept:
-        if not is_dept_visible_to(u, dept):
-            return err("forbidden department scope", 403)
-        q["department"] = dept
-
-    if device:
-        q["user_mac_id"] = device
-
-    return ok(insights.summary(q))
+    base_q = scope_filter_for_logs(u)
+    return ok(insights.summary(base_q, from_day, to_day))
 
 
+# ---------- INSIGHTS: TOP ----------
 @app.get("/api/insights/top")
 def insights_top():
     u = require_auth()
     if not u:
         return err("unauthorized", 401)
 
-    from rbac import scope_filter_for_logs, is_user_visible_to, is_dept_visible_to
-    q = scope_filter_for_logs(u)
+    from_day = (request.args.get("from") or "").strip()
+    to_day = (request.args.get("to") or "").strip()
+    by = (request.args.get("by") or "application").strip()
+    limit = int(request.args.get("limit") or 10)
 
-    username = (request.args.get("username") or "").strip()
-    dept = (request.args.get("department") or "").strip()
-    device = (request.args.get("device") or "").strip()
+    if not from_day or not to_day:
+        return err("from and to are required (YYYY-MM-DD)", 400)
 
-    if username:
-        if not is_user_visible_to(u, username):
-            return err("forbidden username scope", 403)
-        q["company_username"] = username.lower()
-        q["username"] = username.lower()
+    # Safety: only allow known fields
+    if by not in ("application", "category", "operation"):
+        return err("invalid 'by' value", 400)
 
-    if dept:
-        if not is_dept_visible_to(u, dept):
-            return err("forbidden department scope", 403)
-        q["department"] = dept
-
-    if device:
-        q["user_mac_id"] = device
-
-    return ok(insights.top(q))
+    base_q = scope_filter_for_logs(u)
+    return ok(insights.top(base_q, from_day, to_day, by=by, limit=limit))
 
 
+# ---------- INSIGHTS: TIMESERIES ----------
 @app.get("/api/insights/timeseries")
 def insights_timeseries():
     u = require_auth()
     if not u:
         return err("unauthorized", 401)
 
-    from rbac import scope_filter_for_logs, is_user_visible_to, is_dept_visible_to
-    q = scope_filter_for_logs(u)
+    from_day = (request.args.get("from") or "").strip()
+    to_day = (request.args.get("to") or "").strip()
+    if not from_day or not to_day:
+        return err("from and to are required (YYYY-MM-DD)", 400)
 
-    username = (request.args.get("username") or "").strip()
-    dept = (request.args.get("department") or "").strip()
-    device = (request.args.get("device") or "").strip()
-
-    if username:
-        if not is_user_visible_to(u, username):
-            return err("forbidden username scope", 403)
-        q["company_username"] = username.lower()
-        q["username"] = username.lower()
-
-    if dept:
-        if not is_dept_visible_to(u, dept):
-            return err("forbidden department scope", 403)
-        q["department"] = dept
-
-    if device:
-        q["user_mac_id"] = device
-
-    return ok(insights.timeseries(q))
+    base_q = scope_filter_for_logs(u)
+    return ok(insights.timeseries(base_q, from_day, to_day))
 
 
+# ---------- INSIGHTS: HOURLY ----------
 @app.get("/api/insights/hourly")
 def insights_hourly():
     u = require_auth()
     if not u:
         return err("unauthorized", 401)
 
-    from rbac import scope_filter_for_logs, is_user_visible_to, is_dept_visible_to
-    q = scope_filter_for_logs(u)
+    from_day = (request.args.get("from") or "").strip()
+    to_day = (request.args.get("to") or "").strip()
+    if not from_day or not to_day:
+        return err("from and to are required (YYYY-MM-DD)", 400)
 
-    username = (request.args.get("username") or "").strip()
-    dept = (request.args.get("department") or "").strip()
-    device = (request.args.get("device") or "").strip()
-
-    if username:
-        if not is_user_visible_to(u, username):
-            return err("forbidden username scope", 403)
-        q["company_username"] = username.lower()
-        q["username"] = username.lower()
-
-    if dept:
-        if not is_dept_visible_to(u, dept):
-            return err("forbidden department scope", 403)
-        q["department"] = dept
-
-    if device:
-        q["user_mac_id"] = device
-
-    return ok(insights.hourly(q))
+    base_q = scope_filter_for_logs(u)
+    return ok(insights.hourly(base_q, from_day, to_day))
 
 
 def bootstrap_admin_if_missing():
