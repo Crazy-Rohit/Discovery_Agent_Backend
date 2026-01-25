@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, request
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from datetime import datetime
 import secrets
@@ -14,7 +14,7 @@ from auth import (
     jwt_verify,
 )
 
-from rbac import ROLE_C_SUITE, ROLE_DEPT_HEAD, ROLE_TEAM_MEMBER, scope_filter_for_logs;
+from rbac import ROLE_C_SUITE, ROLE_DEPT_HEAD, ROLE_TEAM_MEMBER, scope_filter_for_logs
 
 import users_api
 import departments_api
@@ -23,7 +23,28 @@ import data_api
 import insights
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": CORS_ORIGINS}})
+
+# -----------------------------
+# CORS (Fix for browser "Network Error")
+# -----------------------------
+# Allow your Vite dev server origins explicitly.
+# If CORS_ORIGINS="*" we allow everything (dev mode).
+if CORS_ORIGINS == "*" or CORS_ORIGINS == ["*"]:
+    CORS(
+        app,
+        resources={r"/api/*": {"origins": "*"}},
+        supports_credentials=True,
+        allow_headers=["Content-Type", "Authorization"],
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    )
+else:
+    CORS(
+        app,
+        resources={r"/api/*": {"origins": CORS_ORIGINS}},
+        supports_credentials=True,
+        allow_headers=["Content-Type", "Authorization"],
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    )
 
 
 def ok(data=None, status=200):
@@ -40,7 +61,7 @@ def not_found(_):
 
 
 @app.errorhandler(500)
-def server_error(e):
+def server_error(_e):
     return err("internal server error", 500)
 
 
@@ -99,7 +120,6 @@ def health():
 def register():
     body = request.get_json(silent=True) or {}
 
-    # Portal registration: no device required
     user_mac_id = (body.get("user_mac_id") or "").strip()
     email_in = (body.get("email") or body.get("company_username") or "").strip()
     password = body.get("password") or ""
@@ -128,23 +148,18 @@ def register():
     pw_hash, pw_salt, pw_iter = hash_password(password)
 
     if user:
-        # Activate/update existing record
         users.update_one(
             {"_id": user["_id"]},
             {"$set": {
                 "company_username": email_norm,
                 "company_username_norm": email_norm,
-
                 "full_name": full_name or user.get("full_name"),
                 "contact_no": contact_no or user.get("contact_no"),
-
                 "department": department or user.get("department"),
                 "role_key": role_key or user.get("role_key", ROLE_TEAM_MEMBER),
-
                 "license_accepted": license_accepted,
                 "license_accepted_at": now if license_accepted else user.get("license_accepted_at"),
                 "license_version": license_version,
-
                 "is_active": True,
                 "password_hash": pw_hash,
                 "password_salt": pw_salt,
@@ -155,7 +170,6 @@ def register():
         )
         return ok({"message": "Account activated. Please login with email and password."}, 200)
 
-    # Create new portal user
     if not user_mac_id:
         user_mac_id = f"PORTAL-{secrets.token_hex(6).upper()}"
     if not pc_username:
@@ -164,31 +178,22 @@ def register():
     doc = {
         "company_username": email_norm,
         "company_username_norm": email_norm,
-
         "full_name": full_name or None,
         "contact_no": contact_no or None,
-
         "department": department or None,
         "role_key": role_key,
         "pc_username": pc_username,
-
         "created_at": now,
         "last_seen_at": now,
         "license_accepted": license_accepted,
         "license_accepted_at": now if license_accepted else None,
         "license_version": license_version,
         "is_active": True,
-
         "password_hash": pw_hash,
         "password_salt": pw_salt,
         "password_iter": pw_iter,
         "password_updated_at": now,
     }
-
-    # If your DB wants ObjectId _id (like your screenshot), let Mongo create it.
-    # If you want string _id, uncomment below:
-    # doc["_id"] = user_mac_id
-    # doc["user_mac_id"] = user_mac_id
 
     users.insert_one(doc)
     return ok({"message": "Registration successful. Please login with email and password."}, 201)
@@ -245,7 +250,7 @@ def forgot_password():
     if not new_password or len(new_password) < 4:
         return err("new_password must be at least 4 characters", 400)
 
-    user, email_norm = find_user_by_email(email_in)
+    user, _email_norm = find_user_by_email(email_in)
     if not user:
         return err("user not found", 404)
 
@@ -258,242 +263,18 @@ def forgot_password():
             "password_salt": pw_salt,
             "password_iter": pw_iter,
             "password_updated_at": datetime.utcnow(),
-            "company_username": email_norm,
-            "company_username_norm": email_norm,
-            "last_seen_at": datetime.utcnow(),
         }}
     )
-
-    return ok({"message": "Password changed successfully. Please login again."}, 200)
-
-
-# ---------------- Departments ----------------
-@app.get("/api/departments")
-def list_departments():
-    u = require_auth()
-    if not u:
-        return err("unauthorized", 401)
-    return ok({"departments": departments_api.list_departments()})
+    return ok({"message": "Password updated successfully"})
 
 
-@app.post("/api/departments")
-def create_department():
-    u = require_auth()
-    if not u:
-        return err("unauthorized", 401)
-    if not require_c_suite(u):
-        return err("forbidden", 403)
-    try:
-        name = departments_api.create_department()
-        return ok({"created": name}, 201)
-    except Exception as e:
-        return err(str(e), 400)
-
-
-# ---------------- Users ----------------
-@app.get("/api/users")
-def list_users():
-    u = require_auth()
-    if not u:
-        return err("unauthorized", 401)
-    return ok({"users": users_api.list_users(u)})
-
-
-@app.post("/api/users")
-def create_user():
-    u = require_auth()
-    if not u:
-        return err("unauthorized", 401)
-    if not require_c_suite(u):
-        return err("forbidden", 403)
-    try:
-        created = users_api.create_user()
-        return ok({"created": created}, 201)
-    except Exception as e:
-        return err(str(e), 400)
-
-
-@app.patch("/api/users/<company_username>")
-def patch_user(company_username: str):
-    u = require_auth()
-    if not u:
-        return err("unauthorized", 401)
-    if not require_c_suite(u):
-        return err("forbidden", 403)
-    try:
-        users_api.update_user(company_username)
-        return ok({"updated": company_username})
-    except KeyError:
-        return err("user not found", 404)
-    except Exception as e:
-        return err(str(e), 400)
-
-
-# ---------------- Ingest ----------------
-@app.post("/api/ingest/log")
-def ingest_log():
-    u = require_auth()
-    if not u:
-        return err("unauthorized", 401)
-    try:
-        data = ingest.ingest_log_payload()
-        return ok(data, 201)
-    except Exception as e:
-        return err(str(e), 400)
-
-
-@app.post("/api/ingest/screenshot")
-def ingest_screenshot():
-    u = require_auth()
-    if not u:
-        return err("unauthorized", 401)
-    try:
-        data = ingest.ingest_screenshot_payload()
-        return ok(data, 201)
-    except Exception as e:
-        return err(str(e), 400)
-
-
-# ---------- DATA: LOGS ----------
-@app.get("/api/logs")
-def api_logs():
-    u = require_auth()
-    if not u:
-        return err("unauthorized", 401)
-
-    params = {
-        "from": request.args.get("from"),
-        "to": request.args.get("to"),
-        "page": request.args.get("page", 1),
-        "limit": request.args.get("limit", 50),
-    }
-    return ok(data_api.list_logs(u, params))
-
-
-# ---------- DATA: SCREENSHOTS ----------
-@app.get("/api/screenshots")
-def api_screenshots():
-    u = require_auth()
-    if not u:
-        return err("unauthorized", 401)
-
-    params = {
-        "from": request.args.get("from"),
-        "to": request.args.get("to"),
-        "page": request.args.get("page", 1),
-        "limit": request.args.get("limit", 50),
-    }
-    return ok(data_api.list_screenshots(u, params))
-
-    u = require_auth()
-    if not u:
-        return err("unauthorized", 401)
-    try:
-        return ok(data_api.get_screenshots(u))
-    except PermissionError as e:
-        return err(str(e), 403)
-    except Exception as e:
-        return err(str(e), 400)
-
-
-# ---------------- Insights ----------------
-
-
-# ---------- INSIGHTS: SUMMARY ----------
-@app.get("/api/insights/summary")
-def insights_summary():
-    u = require_auth()
-    if not u:
-        return err("unauthorized", 401)
-
-    from_day = (request.args.get("from") or "").strip()
-    to_day = (request.args.get("to") or "").strip()
-    if not from_day or not to_day:
-        return err("from and to are required (YYYY-MM-DD)", 400)
-
-    base_q = scope_filter_for_logs(u)
-    return ok(insights.summary(base_q, from_day, to_day))
-
-
-# ---------- INSIGHTS: TOP ----------
-@app.get("/api/insights/top")
-def insights_top():
-    u = require_auth()
-    if not u:
-        return err("unauthorized", 401)
-
-    from_day = (request.args.get("from") or "").strip()
-    to_day = (request.args.get("to") or "").strip()
-    by = (request.args.get("by") or "application").strip()
-    limit = int(request.args.get("limit") or 10)
-
-    if not from_day or not to_day:
-        return err("from and to are required (YYYY-MM-DD)", 400)
-
-    # Safety: only allow known fields
-    if by not in ("application", "category", "operation"):
-        return err("invalid 'by' value", 400)
-
-    base_q = scope_filter_for_logs(u)
-    return ok(insights.top(base_q, from_day, to_day, by=by, limit=limit))
-
-
-# ---------- INSIGHTS: TIMESERIES ----------
-@app.get("/api/insights/timeseries")
-def insights_timeseries():
-    u = require_auth()
-    if not u:
-        return err("unauthorized", 401)
-
-    from_day = (request.args.get("from") or "").strip()
-    to_day = (request.args.get("to") or "").strip()
-    if not from_day or not to_day:
-        return err("from and to are required (YYYY-MM-DD)", 400)
-
-    base_q = scope_filter_for_logs(u)
-    return ok(insights.timeseries(base_q, from_day, to_day))
-
-
-# ---------- INSIGHTS: HOURLY ----------
-@app.get("/api/insights/hourly")
-def insights_hourly():
-    u = require_auth()
-    if not u:
-        return err("unauthorized", 401)
-
-    from_day = (request.args.get("from") or "").strip()
-    to_day = (request.args.get("to") or "").strip()
-    if not from_day or not to_day:
-        return err("from and to are required (YYYY-MM-DD)", 400)
-
-    base_q = scope_filter_for_logs(u)
-    return ok(insights.hourly(base_q, from_day, to_day))
-
-
-def bootstrap_admin_if_missing():
-    if users.count_documents({}) == 0:
-        now = datetime.utcnow()
-        pw_hash, pw_salt, pw_iter = hash_password("admin123")
-        users.insert_one({
-            "company_username": "admin@local",
-            "company_username_norm": "admin@local",
-            "department": "IT",
-            "role_key": ROLE_C_SUITE,
-            "license_accepted": True,
-            "license_accepted_at": now,
-            "license_version": "1.0",
-            "created_at": now,
-            "last_seen_at": now,
-            "is_active": True,
-            "password_hash": pw_hash,
-            "password_salt": pw_salt,
-            "password_iter": pw_iter,
-            "password_updated_at": now,
-        })
-        print("[BOOT] Default admin created: admin@local / admin123 (CHANGE ASAP).")
-
-
+# -----------------------------
+# Start
+# -----------------------------
 if __name__ == "__main__":
-    ensure_indexes()
-    bootstrap_admin_if_missing()
+    try:
+        ensure_indexes()
+    except Exception:
+        pass
+
     app.run(host=HOST, port=PORT, debug=DEBUG)

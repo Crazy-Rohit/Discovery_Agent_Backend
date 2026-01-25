@@ -1,134 +1,136 @@
-from typing import Dict, Any, List
-from datetime import datetime
-
-from db import logs as col_logs
-
-
 from datetime import datetime, timedelta
+from flask import Blueprint, jsonify, request
 
-def _parse_date(s: str):
+from db import ensure_indexes, users, logs, screenshots
+from rbac import require_dashboard_access
+
+insights_api = Blueprint("insights_api", __name__)
+
+
+# -------------------------
+# Helpers
+# -------------------------
+def parse_date(s):
+    if not s:
+        return None
     try:
-        return datetime.fromisoformat(s)
+        return datetime.strptime(s, "%Y-%m-%d")
     except Exception:
         return None
 
 
-def _iter_day_range(from_day: str, to_day: str):
-    if not from_day or not to_day:
-        return []
-
-    start = _parse_date(from_day)
-    end = _parse_date(to_day)
-    if not start or not end:
-        return []
-
-    # If user accidentally sends inverted dates, swap safely
-    if start.date() > end.date():
-        start, end = end, start
-
-    days = []
-    cur = start
-    while cur.date() <= end.date():
-        days.append(cur.strftime("%Y-%m-%d"))
-        cur = cur + timedelta(days=1)
-
-    return days
+def daterange(start, end):
+    d = start
+    while d <= end:
+        yield d.strftime("%Y-%m-%d")
+        d += timedelta(days=1)
 
 
+def get_allowed_mac_ids(identity):
+    role = identity.get("role_key")
+    department = identity.get("department")
 
-# =========================
-# SUMMARY
-# =========================
-def summary(base_q: Dict[str, Any], from_day: str, to_day: str) -> Dict[str, Any]:
-    days = _iter_day_range(from_day, to_day)
+    if role == "C_SUITE":
+        q = {}
+        dep = request.args.get("department")
+        if dep:
+            q["department"] = dep
+        return [u["_id"] for u in users.find(q, {"_id": 1})]
+
+    if role == "DEPARTMENT_HEAD":
+        if not department:
+            return []
+        return [u["_id"] for u in users.find({"department": department}, {"_id": 1})]
+
+    return []
+
+
+def read_bucket(doc, key, day):
+    return (doc.get(key) or {}).get(day, []) or []
+
+
+def read_archives(col, mac_id, key, day):
+    prefix = f"{mac_id}|archive|{key}|{day}|"
+    return col.find({"_id": {"$regex": f"^{prefix}"}})
+
+
+# -------------------------
+# Init indexes once
+# -------------------------
+@insights_api.before_app_request
+def _init_indexes():
+    try:
+        ensure_indexes()
+    except Exception:
+        pass
+
+
+# -------------------------
+# APIs
+# -------------------------
+@insights_api.get("/api/insights/summary")
+@require_dashboard_access()
+def summary():
+    """
+    Summary scoped by role:
+      - total users in scope
+      - total logs in date range
+      - total screenshots in date range
+
+    Reads the plugin schema:
+      logs: { logs: { 'YYYY-MM-DD': [events...] } }
+      screenshots: { screenshots: { 'YYYY-MM-DD': [items...] } }
+    """
+    identity = getattr(__import__("flask").g, "identity", {})
+    mac_ids = get_allowed_mac_ids(identity)
+
+    if not mac_ids:
+        return jsonify({"ok": True, "summary": {"users": 0, "logs": 0, "screenshots": 0}})
+
+    start = parse_date(request.args.get("start"))
+    end = parse_date(request.args.get("end"))
+
+    if not start and not end:
+        start = end = datetime.utcnow()
+    elif start and not end:
+        end = start
+    elif end and not start:
+        start = end
 
     total_logs = 0
-    total_screenshots = 0
-    users = set()
+    total_shots = 0
 
-    for doc in col_logs.find(base_q):
-        users.add(doc.get("company_username"))
+    # logs count
+    for doc in logs.find({"_id": {"$in": mac_ids}}):
+        mac = doc["_id"]
+        for day in daterange(start, end):
+            events = read_bucket(doc, "logs", day)
 
-        logs_obj = doc.get("logs") or {}
-        ss_obj = doc.get("screenshots") or {}
+            for a in read_archives(logs, mac, "logs", day):
+                events.extend(read_bucket(a, "logs", day))
 
-        for d in days:
-            total_logs += len(logs_obj.get(d, []))
-            total_screenshots += len(ss_obj.get(d, []))
+            total_logs += len(events)
 
-    return {
-        "range": {"from": from_day, "to": to_day},
-        "totals": {
-            "logs": total_logs,
-            "screenshots": total_screenshots,
-            "unique_users": len(users),
-        },
-    }
+    # screenshots count
+    for doc in screenshots.find({"_id": {"$in": mac_ids}}):
+        mac = doc["_id"]
+        for day in daterange(start, end):
+            items = read_bucket(doc, "screenshots", day)
 
+            for a in read_archives(screenshots, mac, "screenshots", day):
+                items.extend(read_bucket(a, "screenshots", day))
 
-# =========================
-# TOP (applications / categories)
-# =========================
-def top(base_q: Dict[str, Any], from_day: str, to_day: str, by: str, limit: int = 10):
-    days = _iter_day_range(from_day, to_day)
-    counter: Dict[str, int] = {}
+            total_shots += len(items)
 
-    for doc in col_logs.find(base_q):
-        logs_obj = doc.get("logs") or {}
-        for d in days:
-            for rec in logs_obj.get(d, []):
-                key = rec.get(by)
-                if not key:
-                    continue
-                counter[key] = counter.get(key, 0) + 1
-
-    items = [{"name": k, "count": v} for k, v in counter.items()]
-    items.sort(key=lambda x: x["count"], reverse=True)
-
-    return {"items": items[:limit]}
-
-
-# =========================
-# TIMESERIES
-# =========================
-def timeseries(base_q: Dict[str, Any], from_day: str, to_day: str):
-    days = _iter_day_range(from_day, to_day)
-    counts = {d: 0 for d in days}
-
-    for doc in col_logs.find(base_q):
-        logs_obj = doc.get("logs") or {}
-        for d in days:
-            counts[d] += len(logs_obj.get(d, []))
-
-    return {
-        "labels": days,
-        "series": [
-            {
-                "name": "Logs",
-                "data": [counts[d] for d in days],
-            }
-        ],
-    }
-
-
-# =========================
-# HOURLY HEATMAP
-# =========================
-def hourly(base_q: Dict[str, Any], from_day: str, to_day: str):
-    days = _iter_day_range(from_day, to_day)
-    hourly = {str(h): 0 for h in range(24)}
-
-    for doc in col_logs.find(base_q):
-        logs_obj = doc.get("logs") or {}
-        for d in days:
-            for rec in logs_obj.get(d, []):
-                ts = rec.get("ts")
-                if not ts:
-                    continue
-                try:
-                    h = datetime.fromisoformat(ts.replace("Z", "")).hour
-                    hourly[str(h)] += 1
-                except Exception:
-                    continue
-
-    return {"hourly": hourly}
+    return jsonify(
+        {
+            "ok": True,
+            "summary": {
+                "users": len(set(mac_ids)),
+                "logs": total_logs,
+                "screenshots": total_shots,
+                "start": start.strftime("%Y-%m-%d"),
+                "end": end.strftime("%Y-%m-%d"),
+            },
+        }
+    )
