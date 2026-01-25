@@ -14,25 +14,23 @@ from auth import (
     jwt_verify,
 )
 
-from rbac import ROLE_C_SUITE, ROLE_DEPT_HEAD, ROLE_TEAM_MEMBER, scope_filter_for_logs
+from rbac import ROLE_C_SUITE, ROLE_DEPT_HEAD, ROLE_TEAM_MEMBER
 
-import users_api
-import departments_api
-import ingest
-import data_api
-import insights
+# ✅ Import ONLY the Blueprint objects (do NOT import the modules with same names)
+from data_api import data_api as data_api_bp
+from insights import insights_api as insights_api_bp
+
+import ingest  # used for ingest endpoints
 
 app = Flask(__name__)
 
 # -----------------------------
 # CORS (Fix for browser "Network Error")
 # -----------------------------
-# Allow your Vite dev server origins explicitly.
-# If CORS_ORIGINS="*" we allow everything (dev mode).
 if CORS_ORIGINS == "*" or CORS_ORIGINS == ["*"]:
     CORS(
         app,
-        resources={r"/api/*": {"origins": "*"}},
+        resources={r"/*": {"origins": "*"}},
         supports_credentials=True,
         allow_headers=["Content-Type", "Authorization"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -40,11 +38,17 @@ if CORS_ORIGINS == "*" or CORS_ORIGINS == ["*"]:
 else:
     CORS(
         app,
-        resources={r"/api/*": {"origins": CORS_ORIGINS}},
+        resources={r"/*": {"origins": CORS_ORIGINS}},
         supports_credentials=True,
         allow_headers=["Content-Type", "Authorization"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     )
+
+# -----------------------------
+# Register Blueprints (Dashboard APIs)
+# -----------------------------
+app.register_blueprint(data_api_bp)
+app.register_blueprint(insights_api_bp)
 
 
 def ok(data=None, status=200):
@@ -225,7 +229,13 @@ def login():
         {"$set": {"last_seen_at": datetime.utcnow(), "company_username": email_norm, "company_username_norm": email_norm}},
     )
 
-    token = issue_token(str(user["_id"]), user.get("role_key", ROLE_TEAM_MEMBER))
+    token = issue_token(
+        str(user["_id"]),
+        user.get("role_key", ROLE_TEAM_MEMBER),
+        department=user.get("department"),
+        company_username=user.get("company_username_norm") or user.get("company_username"),
+        mac_id=user.get("user_mac_id") or str(user.get("_id")),
+    )
     profile = get_user_public(str(user["_id"]))
     return ok({"token": token, "profile": profile})
 
@@ -266,6 +276,26 @@ def forgot_password():
         }}
     )
     return ok({"message": "Password updated successfully"})
+
+
+# ---------------- INGEST (Agent -> Mongo) ----------------
+
+@app.post("/api/ingest/log")
+def ingest_log():
+    try:
+        payload = ingest.ingest_log_payload()
+        return ok(payload, 201)
+    except Exception as e:
+        return err(str(e), 400)
+
+
+@app.post("/api/ingest/screenshot")
+def ingest_screenshot():
+    try:
+        payload = ingest.ingest_screenshot_payload()
+        return ok(payload, 201)
+    except Exception as e:
+        return err(str(e), 400)
 
 
 # -----------------------------

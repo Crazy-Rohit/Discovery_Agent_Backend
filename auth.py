@@ -44,10 +44,25 @@ def verify_password(pw: str, pw_hash_b64: str, pw_salt_b64: str, pw_iter: int) -
         return False
 
 
-def issue_token(user_id: str, role_key: str = "DEPARTMENT_MEMBER"):
+def issue_token(
+    user_id: str,
+    role_key: str = "DEPARTMENT_MEMBER",
+    *,
+    department: str = None,
+    company_username: str = None,
+    mac_id: str = None,
+):
+    """Issue a JWT for portal/dashboard authentication.
+
+    We keep claims minimal but include department/email so RBAC can work
+    without an extra DB read on every request.
+    """
     payload = {
         "sub": str(user_id),  # ObjectId string OR MAC string
-        "role_key": role_key,
+        "role_key": (role_key or "DEPARTMENT_MEMBER").strip().upper(),
+        "department": department,
+        "company_username": (company_username or None),
+        "mac_id": mac_id,
         "iat": datetime.utcnow(),
         "exp": datetime.utcnow() + timedelta(days=7),
     }
