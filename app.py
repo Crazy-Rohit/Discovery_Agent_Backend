@@ -14,18 +14,20 @@ from auth import (
     jwt_verify,
 )
 
-from rbac import ROLE_C_SUITE, ROLE_DEPT_HEAD, ROLE_TEAM_MEMBER
+from rbac import ROLE_C_SUITE, ROLE_DEPT_HEAD, ROLE_DEPT_MEMBER, ROLE_TEAM_MEMBER
 
 # ✅ Import ONLY the Blueprint objects (do NOT import the modules with same names)
 from data_api import data_api as data_api_bp
 from insights import insights_api as insights_api_bp
+from users_api import users_api as users_api_bp
+from departments_api import departments_api as departments_api_bp
 
 import ingest  # used for ingest endpoints
 
 app = Flask(__name__)
 
 # -----------------------------
-# CORS (Fix for browser "Network Error")
+# CORS
 # -----------------------------
 if CORS_ORIGINS == "*" or CORS_ORIGINS == ["*"]:
     CORS(
@@ -45,10 +47,12 @@ else:
     )
 
 # -----------------------------
-# Register Blueprints (Dashboard APIs)
+# Register Blueprints
 # -----------------------------
 app.register_blueprint(data_api_bp)
 app.register_blueprint(insights_api_bp)
+app.register_blueprint(users_api_bp)
+app.register_blueprint(departments_api_bp)
 
 
 def ok(data=None, status=200):
@@ -109,10 +113,6 @@ def require_auth():
     return current_user()
 
 
-def require_c_suite(u):
-    return u.get("role_key") == ROLE_C_SUITE or u.get("role") == ROLE_C_SUITE
-
-
 @app.get("/api/health")
 def health():
     return ok({"status": "up"})
@@ -122,6 +122,11 @@ def health():
 
 @app.post("/api/auth/register")
 def register():
+    """
+    ✅ Phase 4.7 (Department User Capture)
+    Public registration must ONLY create DEPARTMENT_MEMBER accounts.
+    Admin/Managers are created from Admin dashboard (/api/users) only.
+    """
     body = request.get_json(silent=True) or {}
 
     user_mac_id = (body.get("user_mac_id") or "").strip()
@@ -131,8 +136,12 @@ def register():
     full_name = (body.get("full_name") or body.get("name") or "").strip()
     contact_no = (body.get("contact_no") or "").strip()
 
-    role_key = (body.get("role_key") or ROLE_TEAM_MEMBER).strip().upper()
+    # ✅ Force role to DEPARTMENT_MEMBER always (security)
+    role_key = ROLE_DEPT_MEMBER
+
+    # ✅ Department is REQUIRED for department members (string)
     department = (body.get("department") or "").strip()
+
     pc_username = (body.get("pc_username") or "").strip()
 
     license_accepted = bool(body.get("license_accepted", True))
@@ -141,16 +150,15 @@ def register():
     if not email_in or not password:
         return err("company_username (email) and password are required", 400)
 
-    user, email_norm = find_user_by_email(email_in)
+    if not department:
+        return err("department is required", 400)
 
-    if role_key == "C_SUITE":
-        department = ""  # not required
-    elif not department:
-        return err("department is required for DEPARTMENT_HEAD/DEPARTMENT_MEMBER", 400)
+    user, email_norm = find_user_by_email(email_in)
 
     now = datetime.utcnow()
     pw_hash, pw_salt, pw_iter = hash_password(password)
 
+    # If user exists, update their account and activate
     if user:
         users.update_one(
             {"_id": user["_id"]},
@@ -160,7 +168,7 @@ def register():
                 "full_name": full_name or user.get("full_name"),
                 "contact_no": contact_no or user.get("contact_no"),
                 "department": department or user.get("department"),
-                "role_key": role_key or user.get("role_key", ROLE_TEAM_MEMBER),
+                "role_key": role_key,  # ✅ forced
                 "license_accepted": license_accepted,
                 "license_accepted_at": now if license_accepted else user.get("license_accepted_at"),
                 "license_version": license_version,
@@ -174,6 +182,7 @@ def register():
         )
         return ok({"message": "Account activated. Please login with email and password."}, 200)
 
+    # If new user, generate IDs if missing
     if not user_mac_id:
         user_mac_id = f"PORTAL-{secrets.token_hex(6).upper()}"
     if not pc_username:
@@ -185,7 +194,7 @@ def register():
         "full_name": full_name or None,
         "contact_no": contact_no or None,
         "department": department or None,
-        "role_key": role_key,
+        "role_key": role_key,  # ✅ forced
         "pc_username": pc_username,
         "created_at": now,
         "last_seen_at": now,
