@@ -99,6 +99,36 @@ def paginate(items: List[Dict[str, Any]], page: int, limit: int):
     return {"items": items[start:end], "page": page, "limit": limit, "total": total}
 
 
+def _norm_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def _apply_user_filters(identity: Dict[str, Any], mac_ids: List[str]) -> List[str]:
+    """
+    Optional filters:
+    - user_mac_id=<id>
+    - company_username=<email>
+
+    Applies only if the user is inside scope, otherwise returns empty.
+    """
+    user_mac_id = (request.args.get("user_mac_id") or "").strip()
+    company_username = _norm_email(request.args.get("company_username") or "")
+
+    if user_mac_id:
+        return [user_mac_id] if user_mac_id in set(mac_ids) else []
+
+    if company_username:
+        u = users.find_one({"company_username_norm": company_username}, {"_id": 1})
+        if not u:
+            u = users.find_one({"company_username": company_username}, {"_id": 1})
+        if not u:
+            return []
+        uid = u.get("_id")
+        return [uid] if uid in set(mac_ids) else []
+
+    return mac_ids
+
+
 @data_api.before_app_request
 def _init_indexes():
     try:
@@ -112,6 +142,7 @@ def _init_indexes():
 def get_logs():
     identity = getattr(g, "identity", {}) or {}
     mac_ids = get_allowed_mac_ids(identity)
+    mac_ids = _apply_user_filters(identity, mac_ids)
 
     page = int(request.args.get("page") or 1)
     limit = int(request.args.get("limit") or 100)
@@ -142,14 +173,9 @@ def get_logs():
                         "application": e.get("application"),
                         "category": e.get("category"),
                         "operation": e.get("operation"),
-
-                        # ✅ NEW columns
                         "details": e.get("details") if e.get("details") is not None else e.get("detail"),
                         "window_title": e.get("window_title"),
-
-                        # keep old key too (safe)
                         "detail": e.get("detail"),
-
                         "company_username": u.get("company_username_norm") or u.get("company_username"),
                         "full_name": u.get("full_name"),
                         "department": u.get("department"),
@@ -167,6 +193,7 @@ def get_logs():
 def get_screenshots():
     identity = getattr(g, "identity", {}) or {}
     mac_ids = get_allowed_mac_ids(identity)
+    mac_ids = _apply_user_filters(identity, mac_ids)
 
     page = int(request.args.get("page") or 1)
     limit = int(request.args.get("limit") or 100)
@@ -195,13 +222,10 @@ def get_screenshots():
                     {
                         "ts": s.get("ts"),
                         "application": s.get("application"),
-
-                        # ✅ NEW columns
                         "window_title": s.get("window_title"),
                         "label": s.get("label"),
                         "file_path": s.get("file_path") or s.get("path"),
                         "screenshot_url": s.get("screenshot_url") or s.get("url") or s.get("path"),
-
                         "company_username": u.get("company_username_norm") or u.get("company_username"),
                         "full_name": u.get("full_name"),
                         "department": u.get("department"),

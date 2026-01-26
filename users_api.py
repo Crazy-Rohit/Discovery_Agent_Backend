@@ -1,37 +1,27 @@
 """Users API (RBAC).
 
-Phase 4 requirements:
- - C_SUITE (admin): view + update all users.
- - DEPARTMENT_HEAD (manager): view users in their department only (read-only).
- - DEPARTMENT_MEMBER: no dashboard access.
-
-This module exposes a Flask Blueprint with routes:
- - GET    /api/users
- - POST   /api/users
- - PUT    /api/users/<company_username>
- - PATCH  /api/users/<company_username>
-
-Only C_SUITE can create/update. C_SUITE and DEPARTMENT_HEAD can list, but
-DEPARTMENT_HEAD is scoped to their own department.
+Phase 7 additions:
+ - GET /api/users/<company_username> (detail; scoped)
+ - GET /api/users/<company_username>/analysis (KPIs + charts for that user)
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from flask import Blueprint, jsonify, request, g
 
 from auth import hash_password
-from db import users
+from db import users, logs as logs_col, screenshots as shots_col
 from rbac import (
     require_dashboard_access,
     require_csuite,
     scope_filter_for_users,
     ROLE_DEPT_MEMBER,
 )
-
 
 users_api = Blueprint("users_api", __name__)
 
@@ -72,6 +62,92 @@ def _public_user(u: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def parse_ymd(s: str) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def daterange(start: datetime, end: datetime):
+    d = start
+    while d <= end:
+        yield d.strftime("%Y-%m-%d")
+        d += timedelta(days=1)
+
+
+def parse_iso(ts: str) -> Optional[datetime]:
+    if not ts:
+        return None
+    s = str(ts).strip()
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s)
+    except Exception:
+        try:
+            return datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            return None
+
+
+def read_bucket(doc: Dict[str, Any], key: str, day: str):
+    return (doc.get(key) or {}).get(day, []) or []
+
+
+def read_archives(col, mac_id: str, key: str, day: str):
+    prefix = f"{mac_id}|archive|{key}|{day}|"
+    return col.find({"_id": {"$regex": f"^{prefix}"}})
+
+
+def get_range_from_request() -> (datetime, datetime, str, str):
+    from_s = request.args.get("from") or request.args.get("start")
+    to_s = request.args.get("to") or request.args.get("end")
+
+    start = parse_ymd(from_s)
+    end = parse_ymd(to_s)
+
+    if not start and not end:
+        now = datetime.utcnow()
+        start = end = datetime(now.year, now.month, now.day)
+    elif start and not end:
+        end = start
+    elif end and not start:
+        start = end
+
+    return start, end, (from_s or start.strftime("%Y-%m-%d")), (to_s or end.strftime("%Y-%m-%d"))
+
+
+def compute_active_minutes(times: List[datetime], gap_minutes: int = 5) -> int:
+    if not times:
+        return 0
+    times.sort()
+    total_seconds = len(times) * 60  # base 1 minute per event
+    for i in range(1, len(times)):
+        dt = (times[i] - times[i - 1]).total_seconds()
+        if 0 < dt <= gap_minutes * 60:
+            total_seconds += dt
+    return int(total_seconds // 60)
+
+
+def _get_user_scoped(company_username: str, identity: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    company_username = _norm_email(company_username)
+    u = users.find_one({"company_username_norm": company_username})
+    if not u:
+        u = users.find_one({"company_username": company_username})
+    if not u:
+        return None
+
+    # Scope check (same rules as list)
+    q = scope_filter_for_users(identity)
+    scoped = users.find_one({**q, "_id": u["_id"]}, {"_id": 1})
+    if not scoped:
+        return None
+    return u
+
+
 @users_api.get("/api/users")
 @require_dashboard_access()
 def list_users_route():
@@ -92,6 +168,110 @@ def list_users_route():
     for u in users.find(q, projection).sort("created_at", -1):
         out.append(_public_user(u))
     return ok(out)
+
+
+@users_api.get("/api/users/<company_username>")
+@require_dashboard_access()
+def get_user_detail(company_username: str):
+    identity = getattr(g, "identity", {}) or {}
+    u = _get_user_scoped(company_username, identity)
+    if not u:
+        return err("user not found (or not in your scope)", 404)
+    return ok(_public_user(u))
+
+
+@users_api.get("/api/users/<company_username>/analysis")
+@require_dashboard_access()
+def get_user_analysis(company_username: str):
+    identity = getattr(g, "identity", {}) or {}
+    u = _get_user_scoped(company_username, identity)
+    if not u:
+        return err("user not found (or not in your scope)", 404)
+
+    mac = str(u.get("_id"))
+    start, end, from_s, to_s = get_range_from_request()
+    days = list(daterange(start, end))
+
+    apps = Counter()
+    cats = Counter()
+    logs_count = 0
+    shots_count = 0
+    last_updated: Optional[datetime] = None
+
+    per_day_logs = {d: 0 for d in days}
+    per_day_shots = {d: 0 for d in days}
+    per_day_active_secs = {d: 0 for d in days}
+    times_by_day: Dict[str, List[datetime]] = defaultdict(list)
+
+    # Logs
+    doc = logs_col.find_one({"_id": mac}) or {}
+    for day in days:
+        events = list(read_bucket(doc, "logs", day))
+        for a in read_archives(logs_col, mac, "logs", day):
+            events.extend(read_bucket(a, "logs", day))
+
+        for e in events:
+            if not isinstance(e, dict):
+                continue
+            logs_count += 1
+            per_day_logs[day] += 1
+            apps[str(e.get("application") or "(unknown)")] += 1
+            cats[str(e.get("category") or "(unknown)")] += 1
+
+            dt = parse_iso(e.get("ts") or "")
+            if dt:
+                times_by_day[day].append(dt)
+                if (last_updated is None) or (dt > last_updated):
+                    last_updated = dt
+
+    # Screenshots
+    sdoc = shots_col.find_one({"_id": mac}) or {}
+    for day in days:
+        items = list(read_bucket(sdoc, "screenshots", day))
+        for a in read_archives(shots_col, mac, "screenshots", day):
+            items.extend(read_bucket(a, "screenshots", day))
+
+        for s in items:
+            if not isinstance(s, dict):
+                continue
+            shots_count += 1
+            per_day_shots[day] += 1
+            dt = parse_iso(s.get("ts") or "")
+            if dt and ((last_updated is None) or (dt > last_updated)):
+                last_updated = dt
+
+    # Active time per day (same heuristic as insights)
+    for d in days:
+        per_day_active_secs[d] = compute_active_minutes(times_by_day[d]) * 60
+
+    return ok({
+        "range": {"from": from_s, "to": to_s},
+        "kpis": {
+            "logs": logs_count,
+            "screenshots": shots_count,
+            "total_apps": len([k for k, v in apps.items() if v > 0 and k != "(unknown)"]) or len(apps),
+            "most_used_app": apps.most_common(1)[0][0] if apps else None,
+            "top_category": cats.most_common(1)[0][0] if cats else None,
+            "total_active_minutes": int(sum(per_day_active_secs.values()) // 60),
+            "last_updated": last_updated.isoformat() if last_updated else None,
+        },
+        "charts": {
+            "activity_over_time": {
+                "labels": days,
+                "series": [{"name": "Active Minutes", "data": [int(per_day_active_secs[d] // 60) for d in days]}],
+            },
+            "logs_over_time": {
+                "labels": days,
+                "series": [{"name": "Logs", "data": [int(per_day_logs[d]) for d in days]}],
+            },
+            "screenshots_over_time": {
+                "labels": days,
+                "series": [{"name": "Screenshots", "data": [int(per_day_shots[d]) for d in days]}],
+            },
+            "top_apps": {"items": [{"name": k, "count": v} for k, v in apps.most_common(10)]},
+            "top_categories": {"items": [{"name": k, "count": v} for k, v in cats.most_common(10)]},
+        }
+    })
 
 
 @users_api.post("/api/users")
