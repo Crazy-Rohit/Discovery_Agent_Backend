@@ -137,9 +137,10 @@ def register():
     contact_no = (body.get("contact_no") or "").strip()
 
     # ✅ Force role to DEPARTMENT_MEMBER always (security)
-    role_key = ROLE_DEPT_MEMBER
+    # ✅ Allow role from UI: C_SUITE, DEPARTMENT_HEAD, DEPARTMENT_MEMBER
+    role_key = (body.get("role") or body.get("role_key") or ROLE_DEPT_MEMBER).strip().upper()
 
-    # ✅ Department is REQUIRED for department members (string)
+    # ✅ Department is optional ONLY for C_SUITE
     department = (body.get("department") or "").strip()
 
     pc_username = (body.get("pc_username") or "").strip()
@@ -150,8 +151,14 @@ def register():
     if not email_in or not password:
         return err("company_username (email) and password are required", 400)
 
-    if not department:
+    # ✅ Department required for Department Head + Department Member only
+    if role_key in [ROLE_DEPT_HEAD, ROLE_DEPT_MEMBER] and not department:
         return err("department is required", 400)
+
+    # ✅ For C_SUITE, ignore department even if empty
+    if role_key == ROLE_C_SUITE and not department:
+        department = None
+
 
     user, email_norm = find_user_by_email(email_in)
 
