@@ -72,22 +72,60 @@ def get_range_from_request() -> Tuple[datetime, datetime, str, str]:
 
 
 def get_allowed_mac_ids(identity: Dict[str, Any]) -> List[str]:
+    """Return list of user_mac_id values (_id in users collection) allowed for the caller.
+
+    Supports optional request filters:
+    - department: (c_suites only) limits returned users to that department
+    - user: company username (norm or raw) OR user_mac_id to scope insights to a single selected user
+    """
     role = (identity or {}).get("role_key")
     department = (identity or {}).get("department")
 
+    # Base scope by role
+    base_ids: List[str] = []
     if role == ROLE_C_SUITE:
         q: Dict[str, Any] = {}
         dep = request.args.get("department")
         if dep:
             q["department"] = dep
-        return [u.get("_id") for u in users.find(q, {"_id": 1})]
-
-    if role == ROLE_DEPT_HEAD:
+        base_ids = [u.get("_id") for u in users.find(q, {"_id": 1})]
+    elif role == ROLE_DEPT_HEAD:
         if not department:
-            return []
-        return [u.get("_id") for u in users.find({"department": department}, {"_id": 1})]
+            base_ids = []
+        else:
+            base_ids = [u.get("_id") for u in users.find({"department": department}, {"_id": 1})]
+    else:
+        base_ids = []
 
-    return []
+    if not base_ids:
+        return []
+
+    # Optional single-user scoping (used by dashboard user-selection flow)
+    user_key = (request.args.get("user") or "").strip()
+    if user_key:
+        key_norm = user_key.lower()
+
+        # First, try interpreting as a mac id (_id)
+        if user_key in base_ids:
+            return [user_key]
+
+        # Otherwise, resolve by username fields
+        u = users.find_one(
+            {
+                "_id": {"$in": base_ids},
+                "$or": [
+                    {"company_username_norm": key_norm},
+                    {"company_username": user_key},
+                    {"company_username": key_norm},
+                ],
+            },
+            {"_id": 1},
+        )
+        if not u:
+            return []
+        return [u.get("_id")]
+
+    return base_ids
 
 
 def user_map(mac_ids: List[str]) -> Dict[str, Dict[str, Any]]:
